@@ -36,3 +36,12 @@ CREATE TABLE ratings (
     combined_score numeric(6,2) default 0,
     updated_at timestamptz default now()
 );
+
+CREATE TABLE interactions (
+    id bigserial primary key,
+    actor_user_id bigint references users(id) on delete cascade,
+    target_profile_id bigint references profiles(id) on delete cascade, 
+    action varchar(20) not null check (action in ('like', 'pass', 'super_like')),
+    is_match boolean default false, 
+    created_at timestamptz default now()
+);
