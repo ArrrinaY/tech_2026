@@ -3,9 +3,8 @@ CREATE TABLE users (
     telegram_id bigint unique not null,
     username varchar(128),
     first_name varchar(128),
-    age smallint check (age >= 18),
-    gender varchar(20),
-    city varchar(100),
+
+
     created_at timestamptz default now()
 );
 
@@ -17,7 +16,9 @@ CREATE TABLE profiles (
     photo_urls text[],
     completeness_score numeric(5,4) default 0,
     created_at timestamptz default now()
-);
+    age smallint check (age >= 18),
+    gender varchar(20),
+    city varchar(100),);
 
 CREATE TABLE preferences (
     id bigserial primary key,
