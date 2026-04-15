@@ -22,12 +22,6 @@ env/
 .DS_Store
 Thumbs.db
 
-# Docs
-*.docx
-
-# Git
--p/
-
 # Empty stubs
-src/rating_service/
-src/worker_service/
+project/src/rating_service/
+project/src/worker_service/
