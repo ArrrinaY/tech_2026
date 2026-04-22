@@ -1,4 +1,4 @@
-Broker,MessageSizeBytes,TargetRateMsgS,ProducerThroughputMsgS,ConsumerThroughputMsgS,Sent,Received,Потеряно,AvgLatencyMs,P95LatencyMs,ErrorsProducer,ErrorsConsumer,Degraded
+Broker,MessageSizeBytes,TargetRateMsgS,ProducerThroughputMsgS,ConsumerThroughputMsgS,Sent,Received,Lost,AvgLatencyMs,P95LatencyMs,ErrorsProducer,ErrorsConsumer,Degraded
 rabbitmq,128,1000,999.9,621.6,10002,10002,0,1.13,2.57,0,0,NO
 rabbitmq,128,5000,4606.48,2878.32,46075,46075,0,1.69,3.58,0,0,NO
 rabbitmq,128,10000,5025.05,3127.87,50263,50263,0,1.58,2.88,0,0,NO
