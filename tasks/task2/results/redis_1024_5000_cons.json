@@ -1,0 +1,11 @@
+{
+  "broker": "redis",
+  "queue_name": "bench_q_redis_1024_5000_fbd234d0",
+  "received": 9787,
+  "errors": 0,
+  "remaining_in_queue": 0,
+  "duration_s": 16.19,
+  "throughput_msg_s": 604.62,
+  "avg_latency_ms": 19.83,
+  "p95_latency_ms": 41.06
+}

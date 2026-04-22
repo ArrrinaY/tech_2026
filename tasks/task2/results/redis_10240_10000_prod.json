@@ -1,0 +1,9 @@
+{
+  "broker": "redis",
+  "msg_size_bytes": 10240,
+  "target_rate": 10000,
+  "duration_s": 10,
+  "sent": 5176,
+  "errors": 0,
+  "actual_throughput_msg_s": 517.49
+}

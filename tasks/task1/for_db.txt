@@ -1,0 +1,4 @@
+SELECT * FROM customers ORDER BY customer_id;
+SELECT * FROM products ORDER BY product_id;
+SELECT * FROM orders ORDER BY order_id;
+SELECT * FROM order_items ORDER BY order_item_id;

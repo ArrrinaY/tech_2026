@@ -1,0 +1,9 @@
+{
+  "broker": "rabbitmq",
+  "msg_size_bytes": 102400,
+  "target_rate": 10000,
+  "duration_s": 10,
+  "sent": 6437,
+  "errors": 0,
+  "actual_throughput_msg_s": 642.61
+}

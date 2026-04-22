@@ -1,0 +1,11 @@
+{
+  "broker": "rabbitmq",
+  "queue_name": "bench_q_rabbitmq_10240_5000_7fee295c",
+  "received": 42581,
+  "errors": 0,
+  "remaining_in_queue": 0,
+  "duration_s": 16.13,
+  "throughput_msg_s": 2639.21,
+  "avg_latency_ms": 4.97,
+  "p95_latency_ms": 23.45
+}
