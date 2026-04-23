@@ -25,3 +25,9 @@ Thumbs.db
 # Empty stubs
 project/src/rating_service/
 project/src/worker_service/
+
+# Local runtime artifacts
+project/.run/
+project/logs/
+
+start.txt

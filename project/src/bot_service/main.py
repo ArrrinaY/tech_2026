@@ -6,7 +6,13 @@ import sys
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.client.default import DefaultBotProperties
@@ -28,6 +34,7 @@ router = Router()
 
 # FSM состояния для регистрации анкеты
 class ProfileStates(StatesGroup):
+    waiting_for_name = State()
     waiting_for_bio = State()
     waiting_for_age = State()
     waiting_for_gender = State()
@@ -69,6 +76,21 @@ async def register_user_in_profile_service(
     except httpx.RequestError as e:
         logger.error("profile_service_unavailable", error=str(e))
         return None
+
+
+async def update_user_name_in_profile_service(telegram_id: int, first_name: str) -> bool:
+    """Обновление имени пользователя в Profile Service"""
+    url = f"http://{settings.profile_service_host}:{settings.profile_service_port}/api/v1/users/{telegram_id}"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.put(url, json={"first_name": first_name})
+            if response.status_code == 200:
+                return True
+            logger.error("update_user_name_failed", status=response.status_code, body=response.text)
+            return False
+    except httpx.RequestError as exc:
+        logger.error("update_user_name_error", error=str(exc))
+        return False
 
 
 async def get_user_from_profile_service(telegram_id: int) -> dict | None:
@@ -140,6 +162,23 @@ async def send_interaction_to_profile_service(actor_user_id: int, target_profile
         return None
 
 
+async def get_matches_from_profile_service(user_id: int) -> list[dict] | None:
+    """Получение списка мэтчей пользователя"""
+    url = f"http://{settings.profile_service_host}:{settings.profile_service_port}/api/v1/matches/{user_id}"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url)
+            if response.status_code == 200:
+                return response.json()
+            if response.status_code == 404:
+                return []
+            logger.error("get_matches_failed", status=response.status_code, body=response.text)
+            return None
+    except httpx.RequestError as exc:
+        logger.error("get_matches_error", error=str(exc))
+        return None
+
+
 def format_gender(gender: str | None) -> str:
     """Преобразует значение пола в русскоязычный формат."""
     if not gender:
@@ -164,7 +203,8 @@ def get_search_keyboard(profile_id: int) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="❤️ Лайк", callback_data=f"rate:like:{profile_id}"),
                 InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"rate:pass:{profile_id}"),
-            ]
+            ],
+            [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")],
         ]
     )
 
@@ -186,6 +226,7 @@ async def send_next_candidate(message: Message, telegram_id: int) -> bool:
     rating = candidate.get("rating", {})
     await message.answer(
         "💘 <b>Найдена анкета</b>\n\n"
+        f"Имя: {candidate.get('first_name') or 'Не указано'}\n"
         f"Возраст: {candidate.get('age', 'Не указан')}\n"
         f"Пол: {format_gender(candidate.get('gender'))}\n"
         f"Город: {candidate.get('city', 'Не указан')}\n"
@@ -203,9 +244,23 @@ def get_main_keyboard() -> InlineKeyboardMarkup:
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Заполнить анкету", callback_data="fill_profile")],
         [InlineKeyboardButton(text="👤 Моя анкета", callback_data="my_profile")],
+        [InlineKeyboardButton(text="💞 Мои мэтчи", callback_data="matches")],
         [InlineKeyboardButton(text="🔍 Поиск пары", callback_data="search")],
     ])
     return keyboard
+
+
+async def setup_bot_commands(bot: Bot) -> None:
+    """Настройка команд для кнопки меню Telegram."""
+    commands = [
+        BotCommand(command="start", description="Запустить бота"),
+        BotCommand(command="help", description="Справка по командам"),
+        BotCommand(command="fill", description="Заполнить анкету"),
+        BotCommand(command="profile", description="Моя анкета"),
+        BotCommand(command="matches", description="Показать мои мэтчи"),
+        BotCommand(command="search", description="Поиск пары"),
+    ]
+    await bot.set_my_commands(commands)
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
@@ -219,12 +274,12 @@ async def cmd_start(message: Message):
     user_data = await register_user_in_profile_service(
         telegram_id=message.from_user.id,
         username=message.from_user.username,
-        first_name=message.from_user.first_name,
+        first_name=None,
     )
     
     if user_data:
         await message.answer(
-            f"👋 Привет, {message.from_user.first_name}!\n\n"
+            "👋 Привет!\n\n"
             f"Добро пожаловать в Dating Bot! 💕\n\n"
             f"Я помогу тебе найти идеальную пару.\n"
             f"Заполни анкету, чтобы начать поиск!\n\n"
@@ -234,7 +289,7 @@ async def cmd_start(message: Message):
         )
     else:
         await message.answer(
-            f"👋 Привет, {message.from_user.first_name}!\n\n"
+            "👋 Привет!\n\n"
             f"Добро пожаловать! К сожалению, сейчас возникли технические неполадки.\n"
             f"Попробуй позже! 🔧",
         )
@@ -254,6 +309,7 @@ async def cmd_help(message: Message):
         "/start - Запустить бота\n"
         "/help - Показать эту справку\n"
         "/profile - Моя анкета\n"
+        "/matches - Мои мэтчи\n"
         "/search - Начать поиск\n\n"
         "Или используй кнопки в меню! 👇",
         parse_mode=ParseMode.HTML,
@@ -289,6 +345,7 @@ async def cmd_profile_with_telegram_id(message: Message, telegram_id: int):
             await message.answer(
                 f"📝 <b>Ваша анкета:</b>\n\n"
                 f"Заполненность: {completeness:.0f}%\n"
+                f"Имя: {user_data.get('first_name') or 'Не указано'}\n"
                 f"Возраст: {profile_data.get('age', 'Не указан')}\n"
                 f"Пол: {format_gender(profile_data.get('gender'))}\n"
                 f"Город: {profile_data.get('city', 'Не указан')}\n"
@@ -314,16 +371,36 @@ async def cmd_fill_profile(message: Message, state: FSMContext):
     logger.info("command_fill_profile", user_id=message.from_user.id)
     
     await state.clear()
-    await state.set_state(ProfileStates.waiting_for_bio)
+    await state.set_state(ProfileStates.waiting_for_name)
     
     await message.answer(
         "📝 <b>Заполнение анкеты</b>\n\n"
-        "Расскажите немного о себе (2-3 предложения):\n"
-        "(или отправьте 'пропустить')",
+        "Как вас зовут?\n"
+        "(введите имя, как хотите показываться в анкете)",
         parse_mode=ParseMode.HTML,
     )
     
     messages_processed.labels(service="bot_service", message_type="command_fill").inc()
+
+
+@router.message(ProfileStates.waiting_for_name)
+async def process_name(message: Message, state: FSMContext):
+    """Обработка имени"""
+    first_name = (message.text or "").strip()
+    if not first_name:
+        await message.answer("Пожалуйста, введите имя текстом.")
+        return
+
+    if not await update_user_name_in_profile_service(message.from_user.id, first_name):
+        await message.answer("⚠️ Не удалось сохранить имя, попробуйте еще раз.")
+        return
+
+    await state.set_state(ProfileStates.waiting_for_bio)
+    await message.answer(
+        "Расскажите немного о себе (2-3 предложения):\n"
+        "(или отправьте 'пропустить')",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.message(Command("search"))
@@ -331,6 +408,36 @@ async def cmd_search(message: Message):
     """Запустить поиск анкеты"""
     logger.info("command_search", user_id=message.from_user.id)
     await send_next_candidate(message, message.from_user.id)
+
+
+@router.message(Command("matches"))
+async def cmd_matches(message: Message):
+    """Показать список мэтчей пользователя"""
+    await cmd_matches_with_telegram_id(message, message.from_user.id)
+
+
+async def cmd_matches_with_telegram_id(message: Message, telegram_id: int):
+    """Показать список мэтчей по telegram_id"""
+    user_data = await get_user_from_profile_service(telegram_id)
+    if not user_data:
+        await message.answer("Сначала нажмите /start для регистрации.")
+        return
+
+    matches = await get_matches_from_profile_service(user_data["id"])
+    if matches is None:
+        await message.answer("⚠️ Не удалось загрузить мэтчи, попробуйте позже.")
+        return
+    if not matches:
+        await message.answer("Пока мэтчей нет. Продолжайте ставить лайки в поиске 💘")
+        return
+
+    lines = ["💞 <b>Ваши мэтчи:</b>\n"]
+    for idx, match in enumerate(matches, start=1):
+        lines.append(
+            f"{idx}. {match.get('first_name') or 'Без имени'}, "
+            f"{match.get('age', 'возраст не указан')} — {match.get('city') or 'город не указан'}"
+        )
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 def is_skip_command(text: str) -> bool:
@@ -483,6 +590,13 @@ async def cb_search(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data == "matches")
+async def cb_matches(callback: CallbackQuery):
+    """Показать мэтчи через кнопку меню"""
+    await callback.answer("Загружаю мэтчи...")
+    await cmd_matches_with_telegram_id(callback.message, callback.from_user.id)
+
+
 @router.callback_query(F.data.startswith("rate:"))
 async def cb_rate_profile(callback: CallbackQuery):
     """Обработка лайка/пропуска и выдача следующей анкеты"""
@@ -550,6 +664,13 @@ async def cb_back(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data == "main_menu")
+async def cb_main_menu(callback: CallbackQuery):
+    """Показать главное меню отдельной кнопкой"""
+    await callback.message.answer("🏠 Главное меню:", reply_markup=get_main_keyboard())
+    await callback.answer()
+
+
 
 
 async def main():
@@ -569,6 +690,7 @@ async def main():
     
     # Регистрация роутера
     dp.include_router(router)
+    await setup_bot_commands(bot)
     
     logger.info("bot_starting", bot_id=(await bot.get_me()).id)
     

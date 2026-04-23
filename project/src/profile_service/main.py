@@ -1,3 +1,4 @@
+from datetime import datetime
 from decimal import Decimal
 from typing import Optional, List, Dict, Any
 
@@ -64,6 +65,10 @@ class ProfileUpdateRequest(BaseModel):
     city: Optional[str] = None
 
 
+class UserUpdateRequest(BaseModel):
+    first_name: Optional[str] = Field(None, max_length=128, description="Имя пользователя")
+
+
 class PreferencesRequest(BaseModel):
     user_id: int
     age_min: Optional[int] = Field(18, ge=18, le=99)
@@ -96,6 +101,7 @@ class RatingResponse(BaseModel):
 class DiscoveryProfileResponse(BaseModel):
     profile_id: int
     user_id: int
+    first_name: Optional[str]
     age: Optional[int]
     gender: Optional[str]
     city: Optional[str]
@@ -108,6 +114,17 @@ class InteractionRequest(BaseModel):
     actor_user_id: int
     target_profile_id: int
     action: str = Field(..., pattern="^(like|pass|super_like)$")
+
+
+class MatchProfileResponse(BaseModel):
+    profile_id: int
+    user_id: int
+    first_name: Optional[str]
+    age: Optional[int]
+    gender: Optional[str]
+    city: Optional[str]
+    bio: Optional[str]
+    matched_at: Optional[datetime]
 
 
 def calculate_completeness_score(profile_data: dict) -> float:
@@ -251,23 +268,6 @@ async def rebuild_discovery_cache(session: AsyncSession, user_id: int) -> int:
 
     rows = (await session.execute(query)).scalars().all()
 
-    # Если новых анкет больше нет, запускаем новый круг и выдаем уже просмотренные.
-    if not rows:
-        fallback_query = base_query
-        if preferences.age_min is not None:
-            fallback_query = fallback_query.where(Profile.age >= preferences.age_min)
-        if preferences.age_max is not None:
-            fallback_query = fallback_query.where(Profile.age <= preferences.age_max)
-        if preferences.gender_pref:
-            fallback_query = fallback_query.where(Profile.gender == preferences.gender_pref)
-        if preferences.city_pref:
-            fallback_query = fallback_query.where(Profile.city == preferences.city_pref)
-        fallback_query = fallback_query.order_by(
-            Rating.combined_score.desc().nullslast(),
-            Profile.completeness_score.desc(),
-        ).limit(DISCOVERY_CACHE_BATCH_SIZE)
-        rows = (await session.execute(fallback_query)).scalars().all()
-
     profile_ids = [int(profile_id) for profile_id in rows]
     key = get_discovery_cache_key(user_id)
     await redis_client.delete(key)
@@ -291,10 +291,6 @@ async def pop_next_cached_profile_id(session: AsyncSession, user_id: int) -> Opt
     profile_id = await redis_client.lpop(key)
     if profile_id is None:
         return None
-
-    remaining = await redis_client.llen(key)
-    if remaining == 0:
-        await rebuild_discovery_cache(session, user_id)
 
     return int(profile_id)
 
@@ -387,6 +383,23 @@ async def get_user(
     session: AsyncSession = Depends(get_db)
 ):
     user = await get_user_or_404(telegram_id, session)
+    return UserResponse.model_validate(user)
+
+
+@app.put("/api/v1/users/{telegram_id}", response_model=UserResponse)
+@track_request_duration("profile_service", "/api/v1/users/{telegram_id}")
+async def update_user(
+    telegram_id: int,
+    request: UserUpdateRequest,
+    session: AsyncSession = Depends(get_db)
+):
+    user = await get_user_or_404(telegram_id, session)
+    update_data = request.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(user, field, value)
+
+    await session.commit()
+    await session.refresh(user)
     return UserResponse.model_validate(user)
 
 
@@ -601,15 +614,16 @@ async def get_next_discovery_profile(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Подходящие анкеты не найдены")
 
     result = await session.execute(
-        select(Profile, Rating)
+        select(Profile, Rating, User.first_name)
         .join(Rating, Rating.profile_id == Profile.id, isouter=True)
+        .join(User, User.id == Profile.user_id)
         .where(Profile.id == profile_id)
     )
     row = result.first()
     if not row:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Анкета не найдена")
 
-    profile, rating = row
+    profile, rating, first_name = row
     if rating is None:
         rating = await recalculate_rating_for_profile(session, profile)
         await session.commit()
@@ -618,6 +632,7 @@ async def get_next_discovery_profile(
     return DiscoveryProfileResponse(
         profile_id=profile.id,
         user_id=profile.user_id,
+        first_name=first_name,
         age=profile.age,
         gender=profile.gender,
         city=profile.city,
@@ -695,6 +710,46 @@ async def create_interaction(
             "combined_score": normalize_decimal(target_rating.combined_score),
         },
     }
+
+
+@app.get("/api/v1/matches/{user_id}", response_model=List[MatchProfileResponse])
+@track_request_duration("profile_service", "/api/v1/matches/{user_id}")
+async def get_matches(
+    user_id: int,
+    session: AsyncSession = Depends(get_db)
+):
+    user_result = await session.execute(select(User).where(User.id == user_id))
+    user = user_result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Пользователь не найден")
+
+    query = (
+        select(Interaction, Profile, User.first_name)
+        .join(Profile, Profile.id == Interaction.target_profile_id)
+        .join(User, User.id == Profile.user_id)
+        .where(Interaction.actor_user_id == user_id)
+        .where(Interaction.is_match.is_(True))
+        .order_by(Interaction.created_at.desc())
+    )
+    rows = (await session.execute(query)).all()
+
+    # Защищаемся от дубликатов (если пользователь повторно ставил лайк той же анкете).
+    unique_matches: dict[int, MatchProfileResponse] = {}
+    for interaction, profile, first_name in rows:
+        if profile.id in unique_matches:
+            continue
+        unique_matches[profile.id] = MatchProfileResponse(
+            profile_id=profile.id,
+            user_id=profile.user_id,
+            first_name=first_name,
+            age=profile.age,
+            gender=profile.gender,
+            city=profile.city,
+            bio=profile.bio,
+            matched_at=interaction.created_at,
+        )
+
+    return list(unique_matches.values())
 
 
 @app.get("/metrics")
