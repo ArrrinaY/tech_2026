@@ -3,7 +3,7 @@ from decimal import Decimal
 from typing import Optional, List
 from sqlalchemy import (
     BigInteger, Boolean, CheckConstraint, Column, DateTime, ForeignKey,
-    Integer, Numeric, SmallInteger, String, Text, ARRAY
+    Integer, Numeric, SmallInteger, String, Text, ARRAY, Index
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship, declarative_base
@@ -49,6 +49,8 @@ class Profile(Base):
 
     __table_args__ = (
         CheckConstraint("age >= 18", name="check_age_minimum"),
+        Index("ix_profiles_city", "city"),
+        Index("ix_profiles_gender_age", "gender", "age"),
     )
 
     def __repr__(self):
@@ -83,6 +85,10 @@ class Rating(Base):
 
     profile = relationship("Profile", back_populates="rating")
 
+    __table_args__ = (
+        Index("ix_ratings_combined_score", "combined_score"),
+    )
+
     def __repr__(self):
         return f"<Rating(id={self.id}, profile_id={self.profile_id}, combined_score={self.combined_score})>"
 
@@ -99,6 +105,9 @@ class Interaction(Base):
 
     __table_args__ = (
         CheckConstraint("action IN ('like', 'pass', 'super_like')", name="check_action_valid"),
+        Index("ix_interactions_target_action", "target_profile_id", "action"),
+        Index("ix_interactions_actor_target", "actor_user_id", "target_profile_id"),
+        Index("ix_interactions_target_match", "target_profile_id", "is_match"),
     )
 
     def __repr__(self):

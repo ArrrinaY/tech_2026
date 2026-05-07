@@ -1,16 +1,24 @@
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional, List, Dict, Any
+from io import BytesIO
+from uuid import uuid4
+import json
 
 import redis.asyncio as redis
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File
 from pydantic import BaseModel, Field
 from sqlalchemy import select, delete, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.database import get_db, init_db
 from common.logging_config import setup_logging, get_logger
-from common.metrics import user_registrations_total, track_request_duration
+from common.metrics import (
+    user_registrations_total,
+    track_request_duration,
+    cached_profiles,
+    rating_calculation_duration,
+)
 from common.models import User, Profile, Preferences, Rating, Interaction
 from common.config import get_settings
 
@@ -22,6 +30,7 @@ DISCOVERY_CACHE_BATCH_SIZE = 10
 DISCOVERY_CACHE_PREFIX = "dating:discovery"
 
 redis_client: Optional[redis.Redis] = None
+minio_client: Any = None
 
 app = FastAPI(
     title="Profile Service",
@@ -158,20 +167,72 @@ def normalize_decimal(value: Decimal | float | int | None) -> float:
 
 
 def calculate_primary_score(profile: Profile) -> float:
-    completeness = normalize_decimal(profile.completeness_score)
-    photos_count = len(profile.photo_urls or [])
-    photo_bonus = min(photos_count / 5, 1.0)
-    score = (completeness * 70) + (photo_bonus * 30)
+    profile_fields_completeness = (
+        (0.25 if profile.bio else 0.0)
+        + (0.25 if profile.age else 0.0)
+        + (0.25 if profile.gender else 0.0)
+        + (0.25 if profile.city else 0.0)
+    )
+    score = profile_fields_completeness * 100
     return round(score, 2)
 
 
 def calculate_combined_score(primary_score: float, behavioral_score: float, referral_bonus: float = 0.0) -> float:
-    combined = (primary_score * 0.6) + (behavioral_score * 0.35) + (referral_bonus * 0.05)
+    combined = (primary_score * 0.6) + (behavioral_score * 0.4) 
     return round(combined, 2)
 
 
 def get_discovery_cache_key(user_id: int) -> str:
     return f"{DISCOVERY_CACHE_PREFIX}:{user_id}:queue"
+
+
+def get_minio_object_url(object_name: str) -> str:
+    return f"http://{settings.minio_endpoint}/{settings.minio_bucket}/{object_name}"
+
+
+def ensure_minio_bucket_public_read() -> None:
+    if minio_client is None:
+        raise RuntimeError("MinIO client is not initialized")
+
+    # Allow anonymous read access so bot_service can fetch profile photos by URL.
+    public_read_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"AWS": ["*"]},
+                "Action": ["s3:GetBucketLocation", "s3:ListBucket"],
+                "Resource": [f"arn:aws:s3:::{settings.minio_bucket}"],
+            },
+            {
+                "Effect": "Allow",
+                "Principal": {"AWS": ["*"]},
+                "Action": ["s3:GetObject"],
+                "Resource": [f"arn:aws:s3:::{settings.minio_bucket}/*"],
+            },
+        ],
+    }
+    minio_client.set_bucket_policy(settings.minio_bucket, json.dumps(public_read_policy))
+
+
+def upload_photo_to_minio(user_id: int, file_name: str, content: bytes, content_type: str | None) -> str:
+    if minio_client is None:
+        raise RuntimeError("MinIO client is not initialized")
+
+    extension = ""
+    if "." in file_name:
+        extension = "." + file_name.rsplit(".", 1)[1].lower()
+    object_name = f"user-{user_id}/{uuid4().hex}{extension}"
+
+    data_stream = BytesIO(content)
+    minio_client.put_object(
+        bucket_name=settings.minio_bucket,
+        object_name=object_name,
+        data=data_stream,
+        length=len(content),
+        content_type=content_type or "application/octet-stream",
+    )
+    return get_minio_object_url(object_name)
 
 
 async def invalidate_discovery_cache(user_id: int) -> None:
@@ -181,19 +242,14 @@ async def invalidate_discovery_cache(user_id: int) -> None:
 
 
 async def calculate_behavioral_score(session: AsyncSession, profile_id: int) -> float:
-    likes_query = select(func.count(Interaction.id)).where(
-        and_(Interaction.target_profile_id == profile_id, Interaction.action.in_(["like", "super_like"]))
-    )
-    passes_query = select(func.count(Interaction.id)).where(
-        and_(Interaction.target_profile_id == profile_id, Interaction.action == "pass")
-    )
-    matches_query = select(func.count(Interaction.id)).where(
-        and_(Interaction.target_profile_id == profile_id, Interaction.is_match.is_(True))
-    )
-
-    likes = (await session.execute(likes_query)).scalar() or 0
-    passes = (await session.execute(passes_query)).scalar() or 0
-    matches = (await session.execute(matches_query)).scalar() or 0
+    counts_query = select(
+        func.count(Interaction.id)
+        .filter(Interaction.action.in_(["like", "super_like"]))
+        .label("likes"),
+        func.count(Interaction.id).filter(Interaction.action == "pass").label("passes"),
+        func.count(Interaction.id).filter(Interaction.is_match.is_(True)).label("matches"),
+    ).where(Interaction.target_profile_id == profile_id)
+    likes, passes, matches = (await session.execute(counts_query)).one()
 
     total = likes + passes
     if total == 0:
@@ -210,7 +266,8 @@ async def recalculate_rating_for_profile(session: AsyncSession, profile: Profile
     rating = result.scalar_one_or_none()
 
     primary_score = calculate_primary_score(profile)
-    behavioral_score = await calculate_behavioral_score(session, profile.id)
+    with rating_calculation_duration.labels(service="profile_service", rating_type="behavioral").time():
+        behavioral_score = await calculate_behavioral_score(session, profile.id)
     combined_score = calculate_combined_score(primary_score, behavioral_score)
 
     if rating is None:
@@ -275,6 +332,7 @@ async def rebuild_discovery_cache(session: AsyncSession, user_id: int) -> int:
     if profile_ids:
         await redis_client.rpush(key, *profile_ids)
         await redis_client.expire(key, 1800)
+    cached_profiles.labels(service="profile_service").set(len(profile_ids))
 
     return len(profile_ids)
 
@@ -292,7 +350,28 @@ async def pop_next_cached_profile_id(session: AsyncSession, user_id: int) -> Opt
     if profile_id is None:
         return None
 
+    remaining = await redis_client.llen(key)
+    cached_profiles.labels(service="profile_service").set(remaining)
+
     return int(profile_id)
+
+
+@app.post("/api/v1/admin/tasks/recalculate-ratings", response_model=dict)
+@track_request_duration("profile_service", "/api/v1/admin/tasks/recalculate-ratings")
+async def trigger_recalculate_ratings_task():
+    from profile_service.celery_app import celery_app
+    task = celery_app.send_task("profile_service.tasks.recalculate_all_ratings")
+    logger.info("ratings_recalculation_task_sent", task_id=task.id)
+    return {"status": "queued", "task_id": task.id}
+
+
+@app.post("/api/v1/admin/tasks/warm-discovery-cache", response_model=dict)
+@track_request_duration("profile_service", "/api/v1/admin/tasks/warm-discovery-cache")
+async def trigger_warm_discovery_cache_task():
+    from profile_service.celery_app import celery_app
+    task = celery_app.send_task("profile_service.tasks.warm_discovery_cache")
+    logger.info("cache_warm_task_sent", task_id=task.id)
+    return {"status": "queued", "task_id": task.id}
 
 
 async def get_user_or_404(telegram_id: int, session: AsyncSession) -> User:
@@ -538,6 +617,57 @@ async def update_profile(
     return ProfileResponse.model_validate(profile)
 
 
+@app.post("/api/v1/profiles/{user_id}/photos", response_model=dict)
+@track_request_duration("profile_service", "/api/v1/profiles/{user_id}/photos")
+async def upload_profile_photo(
+    user_id: int,
+    photo: UploadFile = File(...),
+    session: AsyncSession = Depends(get_db),
+):
+    result = await session.execute(select(Profile).where(Profile.user_id == user_id))
+    profile = result.scalar_one_or_none()
+    if not profile:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Анкета для user_id={user_id} не найдена",
+        )
+
+    if minio_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="MinIO недоступен",
+        )
+
+    file_content = await photo.read()
+    if not file_content:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Файл пустой")
+
+    try:
+        photo_url = upload_photo_to_minio(user_id, photo.filename or "photo.jpg", file_content, photo.content_type)
+    except Exception as exc:
+        logger.error("photo_upload_failed", user_id=user_id, error=str(exc))
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Ошибка загрузки в MinIO")
+
+    photo_urls = list(profile.photo_urls or [])
+    photo_urls.append(photo_url)
+    profile.photo_urls = photo_urls
+    profile.completeness_score = calculate_completeness_score(
+        {
+            "bio": profile.bio,
+            "age": profile.age,
+            "gender": profile.gender,
+            "city": profile.city,
+            "photo_urls": profile.photo_urls,
+        }
+    )
+    await recalculate_rating_for_profile(session, profile)
+    await session.commit()
+    await session.refresh(profile)
+
+    logger.info("photo_uploaded_to_minio", user_id=user_id, photo_url=photo_url)
+    return {"status": "ok", "photo_url": photo_url, "photo_urls": profile.photo_urls}
+
+
 @app.delete("/api/v1/profiles/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 @track_request_duration("profile_service", "/api/v1/profiles/{user_id}")
 async def delete_profile(
@@ -767,7 +897,7 @@ async def get_prometheus_metrics():
 async def startup_event():
     logger.info("profile_service_startup")
     await init_db()
-    global redis_client
+    global redis_client, minio_client
     redis_client = redis.from_url(settings.redis_url, decode_responses=True)
     try:
         await redis_client.ping()
@@ -775,6 +905,23 @@ async def startup_event():
     except Exception as exc:
         logger.error("redis_connection_failed", error=str(exc))
         redis_client = None
+
+    try:
+        from minio import Minio
+
+        minio_client = Minio(
+            endpoint=settings.minio_endpoint,
+            access_key=settings.minio_access_key,
+            secret_key=settings.minio_secret_key,
+            secure=False,
+        )
+        if not minio_client.bucket_exists(settings.minio_bucket):
+            minio_client.make_bucket(settings.minio_bucket)
+        ensure_minio_bucket_public_read()
+        logger.info("minio_connected", endpoint=settings.minio_endpoint, bucket=settings.minio_bucket)
+    except Exception as exc:
+        logger.error("minio_connection_failed", error=str(exc))
+        minio_client = None
 
 
 @app.on_event("shutdown")
@@ -788,4 +935,4 @@ async def shutdown_event():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=settings.profile_service_port)

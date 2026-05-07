@@ -43,6 +43,12 @@ class Settings(BaseSettings):
     def rabbitmq_url(self) -> str:
         return f"amqp://{self.rabbitmq_user}:{self.rabbitmq_password}@{self.rabbitmq_host}:{self.rabbitmq_port}//"
 
+    celery_task_always_eager: bool = False
+    celery_task_serializer: str = "json"
+    celery_result_serializer: str = "json"
+    celery_accept_content: str = "json"
+    celery_timezone: str = "UTC"
+
     minio_endpoint: str = "localhost:9000"
     minio_access_key: str = "dating_user"
     minio_secret_key: str = "dating_password"
@@ -51,7 +57,7 @@ class Settings(BaseSettings):
     bot_token: str = ""
 
     profile_service_host: str = "localhost"
-    profile_service_port: int = 8001
+    profile_service_port: int = 8201
 
     class Config:
         env_file = str(ENV_FILE)

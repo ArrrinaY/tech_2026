@@ -3,6 +3,9 @@ Bot Service - Telegram бот для дейтинг-приложения
 """
 import asyncio
 import sys
+from html import escape
+from typing import Optional
+import time
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
@@ -12,6 +15,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     BotCommand,
+    BufferedInputFile,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -28,6 +32,128 @@ setup_logging("bot_service")
 logger = get_logger("bot_service")
 
 settings = get_settings()
+PROFILE_SERVICE_BASE_URL = f"http://{settings.profile_service_host}:{settings.profile_service_port}"
+HTTP_TIMEOUT = httpx.Timeout(connect=3.0, read=10.0, write=10.0, pool=5.0)
+HTTP_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20)
+http_client: Optional[httpx.AsyncClient] = None
+USER_CACHE_TTL_SECONDS = 60.0
+SEARCH_RATE_LIMIT_SECONDS = 1.2
+RATE_DEDUP_TTL_SECONDS = 3.0
+user_lookup_cache: dict[int, tuple[float, dict]] = {}
+last_search_action_ts: dict[int, float] = {}
+recent_rate_actions: dict[str, float] = {}
+user_action_locks: dict[int, asyncio.Lock] = {}
+
+
+def get_http_client() -> httpx.AsyncClient:
+    global http_client
+    if http_client is None or http_client.is_closed:
+        http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, limits=HTTP_LIMITS)
+    return http_client
+
+
+async def close_http_client() -> None:
+    global http_client
+    if http_client is not None and not http_client.is_closed:
+        await http_client.aclose()
+    http_client = None
+
+
+def _cache_get_user(telegram_id: int) -> dict | None:
+    cached = user_lookup_cache.get(telegram_id)
+    if not cached:
+        return None
+    ts, payload = cached
+    if time.monotonic() - ts > USER_CACHE_TTL_SECONDS:
+        user_lookup_cache.pop(telegram_id, None)
+        return None
+    return payload
+
+
+def _cache_put_user(telegram_id: int, payload: dict) -> None:
+    user_lookup_cache[telegram_id] = (time.monotonic(), payload)
+
+
+def should_rate_limit_search_action(telegram_id: int) -> bool:
+    now = time.monotonic()
+    last_ts = last_search_action_ts.get(telegram_id)
+    if last_ts is not None and now - last_ts < SEARCH_RATE_LIMIT_SECONDS:
+        return True
+    last_search_action_ts[telegram_id] = now
+    return False
+
+
+def is_duplicate_rate_action(telegram_id: int, profile_id: int, action: str) -> bool:
+    now = time.monotonic()
+    action_key = f"{telegram_id}:{profile_id}:{action}"
+
+    # Opportunistic cleanup of stale dedup entries.
+    stale_keys = [key for key, ts in recent_rate_actions.items() if now - ts > RATE_DEDUP_TTL_SECONDS]
+    for key in stale_keys:
+        recent_rate_actions.pop(key, None)
+
+    existing_ts = recent_rate_actions.get(action_key)
+    if existing_ts is not None and now - existing_ts <= RATE_DEDUP_TTL_SECONDS:
+        return True
+
+    recent_rate_actions[action_key] = now
+    return False
+
+
+def get_user_action_lock(telegram_id: int) -> asyncio.Lock:
+    lock = user_action_locks.get(telegram_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        user_action_locks[telegram_id] = lock
+    return lock
+
+
+def prioritize_photo_urls(photo_urls: list[str]) -> list[str]:
+    minio_host = settings.minio_endpoint
+
+    def sort_key(url: str) -> tuple[int, int]:
+        # Prefer MinIO URLs first, then everything else.
+        return (0 if minio_host in url else 1, len(url))
+
+    return sorted(photo_urls, key=sort_key)
+
+
+async def send_photo_caption_or_text(
+    message: Message,
+    photo_urls: list[str],
+    caption_text: str,
+    telegram_id: int,
+    log_prefix: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    prioritized = prioritize_photo_urls(photo_urls)
+    for idx, photo_url in enumerate(prioritized):
+        try:
+            response = await get_http_client().get(photo_url)
+            if response.status_code != 200:
+                logger.warning(
+                    f"{log_prefix}_photo_unavailable",
+                    telegram_id=telegram_id,
+                    photo_url=photo_url,
+                    status=response.status_code,
+                )
+                continue
+            photo = BufferedInputFile(response.content, filename=f"{log_prefix}_{telegram_id}_{idx}.jpg")
+            await message.answer_photo(
+                photo=photo,
+                caption=caption_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+            )
+            return
+        except Exception as exc:
+            logger.warning(
+                f"{log_prefix}_photo_send_failed",
+                telegram_id=telegram_id,
+                photo_url=photo_url,
+                error=str(exc),
+            )
+    await message.answer(caption_text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
 
 # Роутеры
 router = Router()
@@ -50,28 +176,25 @@ async def register_user_in_profile_service(
     first_name: str | None
 ) -> dict | None:
     """Регистрация пользователя в Profile Service"""
-    url = f"http://{settings.profile_service_host}:{settings.profile_service_port}/api/v1/users/register"
+    url = f"{PROFILE_SERVICE_BASE_URL}/api/v1/users/register"
     
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                url,
-                json={
-                    "telegram_id": telegram_id,
-                    "username": username,
-                    "first_name": first_name,
-                }
-            )
-            
-            if response.status_code == 201:
-                logger.info("user_registered_in_profile_service", telegram_id=telegram_id)
-                return response.json()
-            elif response.status_code == 409:
-                logger.info("user_already_exists", telegram_id=telegram_id)
-                return response.json()
-            else:
-                logger.error("profile_service_error", status=response.status_code, body=response.text)
-                return None
+        response = await get_http_client().post(
+            url,
+            json={
+                "telegram_id": telegram_id,
+                "username": username,
+                "first_name": first_name,
+            }
+        )
+        if response.status_code == 201:
+            logger.info("user_registered_in_profile_service", telegram_id=telegram_id)
+            return response.json()
+        if response.status_code == 409:
+            logger.info("user_already_exists", telegram_id=telegram_id)
+            return response.json()
+        logger.error("profile_service_error", status=response.status_code, body=response.text)
+        return None
                 
     except httpx.RequestError as e:
         logger.error("profile_service_unavailable", error=str(e))
@@ -80,14 +203,13 @@ async def register_user_in_profile_service(
 
 async def update_user_name_in_profile_service(telegram_id: int, first_name: str) -> bool:
     """Обновление имени пользователя в Profile Service"""
-    url = f"http://{settings.profile_service_host}:{settings.profile_service_port}/api/v1/users/{telegram_id}"
+    url = f"{PROFILE_SERVICE_BASE_URL}/api/v1/users/{telegram_id}"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.put(url, json={"first_name": first_name})
-            if response.status_code == 200:
-                return True
-            logger.error("update_user_name_failed", status=response.status_code, body=response.text)
-            return False
+        response = await get_http_client().put(url, json={"first_name": first_name})
+        if response.status_code == 200:
+            return True
+        logger.error("update_user_name_failed", status=response.status_code, body=response.text)
+        return False
     except httpx.RequestError as exc:
         logger.error("update_user_name_error", error=str(exc))
         return False
@@ -95,16 +217,19 @@ async def update_user_name_in_profile_service(telegram_id: int, first_name: str)
 
 async def get_user_from_profile_service(telegram_id: int) -> dict | None:
     """Получение данных пользователя из Profile Service"""
-    url = f"http://{settings.profile_service_host}:{settings.profile_service_port}/api/v1/users/{telegram_id}"
-    logger.info("get_user_from_profile_service", url=url, telegram_id=telegram_id)
+    cached = _cache_get_user(telegram_id)
+    if cached is not None:
+        return cached
+
+    url = f"{PROFILE_SERVICE_BASE_URL}/api/v1/users/{telegram_id}"
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url)
-            logger.info("get_user_response", status=response.status_code, text=response.text[:200])
-            if response.status_code == 200:
-                return response.json()
-            return None
+        response = await get_http_client().get(url)
+        if response.status_code == 200:
+            payload = response.json()
+            _cache_put_user(telegram_id, payload)
+            return payload
+        return None
     except httpx.RequestError as e:
         logger.error("get_user_error", error=str(e))
         return None
@@ -112,31 +237,29 @@ async def get_user_from_profile_service(telegram_id: int) -> dict | None:
 
 async def get_profile_from_profile_service(user_id: int) -> dict | None:
     """Получение анкеты из Profile Service"""
-    url = f"http://{settings.profile_service_host}:{settings.profile_service_port}/api/v1/profiles/{user_id}"
+    url = f"{PROFILE_SERVICE_BASE_URL}/api/v1/profiles/{user_id}"
     
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url)
-            if response.status_code == 200:
-                return response.json()
-            return None
+        response = await get_http_client().get(url)
+        if response.status_code == 200:
+            return response.json()
+        return None
     except httpx.RequestError:
         return None
 
 
 async def get_next_discovery_profile(user_id: int) -> dict | None:
     """Получение следующей анкеты для показа пользователю"""
-    url = f"http://{settings.profile_service_host}:{settings.profile_service_port}/api/v1/discovery/{user_id}/next"
+    url = f"{PROFILE_SERVICE_BASE_URL}/api/v1/discovery/{user_id}/next"
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url)
-            if response.status_code == 200:
-                return response.json()
-            if response.status_code == 404:
-                return None
-            logger.error("get_next_discovery_profile_failed", status=response.status_code, body=response.text)
+        response = await get_http_client().get(url)
+        if response.status_code == 200:
+            return response.json()
+        if response.status_code == 404:
             return None
+        logger.error("get_next_discovery_profile_failed", status=response.status_code, body=response.text)
+        return None
     except httpx.RequestError as exc:
         logger.error("get_next_discovery_profile_error", error=str(exc))
         return None
@@ -144,19 +267,18 @@ async def get_next_discovery_profile(user_id: int) -> dict | None:
 
 async def send_interaction_to_profile_service(actor_user_id: int, target_profile_id: int, action: str) -> dict | None:
     """Отправка лайка/пропуска в Profile Service"""
-    url = f"http://{settings.profile_service_host}:{settings.profile_service_port}/api/v1/interactions"
+    url = f"{PROFILE_SERVICE_BASE_URL}/api/v1/interactions"
     payload = {
         "actor_user_id": actor_user_id,
         "target_profile_id": target_profile_id,
         "action": action,
     }
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(url, json=payload)
-            if response.status_code == 200:
-                return response.json()
-            logger.error("interaction_failed", status=response.status_code, body=response.text)
-            return None
+        response = await get_http_client().post(url, json=payload)
+        if response.status_code == 200:
+            return response.json()
+        logger.error("interaction_failed", status=response.status_code, body=response.text)
+        return None
     except httpx.RequestError as exc:
         logger.error("interaction_request_error", error=str(exc))
         return None
@@ -164,19 +286,52 @@ async def send_interaction_to_profile_service(actor_user_id: int, target_profile
 
 async def get_matches_from_profile_service(user_id: int) -> list[dict] | None:
     """Получение списка мэтчей пользователя"""
-    url = f"http://{settings.profile_service_host}:{settings.profile_service_port}/api/v1/matches/{user_id}"
+    url = f"{PROFILE_SERVICE_BASE_URL}/api/v1/matches/{user_id}"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url)
-            if response.status_code == 200:
-                return response.json()
-            if response.status_code == 404:
-                return []
-            logger.error("get_matches_failed", status=response.status_code, body=response.text)
-            return None
+        response = await get_http_client().get(url)
+        if response.status_code == 200:
+            return response.json()
+        if response.status_code == 404:
+            return []
+        logger.error("get_matches_failed", status=response.status_code, body=response.text)
+        return None
     except httpx.RequestError as exc:
         logger.error("get_matches_error", error=str(exc))
         return None
+
+
+async def save_profile_data(user_id: int, data: dict) -> bool:
+    """Сохраняет анкету пользователя в Profile Service."""
+    url = f"{PROFILE_SERVICE_BASE_URL}/api/v1/profiles/{user_id}"
+    try:
+        response = await get_http_client().put(url, json=data)
+        if response.status_code == 200:
+            return True
+        logger.error("failed_to_save_profile", status=response.status_code, text=response.text)
+        return False
+    except Exception as exc:
+        logger.error("failed_to_save_profile", error=str(exc))
+        return False
+
+
+async def upload_profile_photo_to_profile_service(
+    user_id: int,
+    file_name: str,
+    content: bytes,
+    content_type: str = "image/jpeg",
+) -> bool:
+    """Загружает фото пользователя в MinIO через Profile Service."""
+    url = f"{PROFILE_SERVICE_BASE_URL}/api/v1/profiles/{user_id}/photos"
+    files = {"photo": (file_name, content, content_type)}
+    try:
+        response = await get_http_client().post(url, files=files)
+        if response.status_code == 200:
+            return True
+        logger.error("failed_to_upload_photo", status=response.status_code, text=response.text)
+        return False
+    except Exception as exc:
+        logger.error("failed_to_upload_photo", error=str(exc))
+        return False
 
 
 def format_gender(gender: str | None) -> str:
@@ -224,17 +379,31 @@ async def send_next_candidate(message: Message, telegram_id: int) -> bool:
         return False
 
     rating = candidate.get("rating", {})
-    await message.answer(
+    first_name = escape(str(candidate.get("first_name") or "Не указано"))
+    age = escape(str(candidate.get("age", "Не указан")))
+    gender = escape(format_gender(candidate.get("gender")))
+    city = escape(str(candidate.get("city", "Не указан")))
+    bio = escape(str(candidate.get("bio") or "Не указано"))
+    candidate_text = (
         "💘 <b>Найдена анкета</b>\n\n"
-        f"Имя: {candidate.get('first_name') or 'Не указано'}\n"
-        f"Возраст: {candidate.get('age', 'Не указан')}\n"
-        f"Пол: {format_gender(candidate.get('gender'))}\n"
-        f"Город: {candidate.get('city', 'Не указан')}\n"
-        f"О себе: {candidate.get('bio') or 'Не указано'}\n\n"
+        f"Имя: {first_name}\n"
+        f"Возраст: {age}\n"
+        f"Пол: {gender}\n"
+        f"Город: {city}\n"
+        f"О себе: {bio}\n\n"
         f"Рейтинг анкеты: {rating.get('combined_score', 0):.1f}\n"
-        f"(первичный: {rating.get('primary_score', 0):.1f}, поведенческий: {rating.get('behavioral_score', 0):.1f})",
-        parse_mode=ParseMode.HTML,
-        reply_markup=get_search_keyboard(candidate["profile_id"]),
+        f"(первичный: {rating.get('primary_score', 0):.1f}, поведенческий: {rating.get('behavioral_score', 0):.1f})"
+    )
+    keyboard = get_search_keyboard(candidate["profile_id"])
+
+    photo_urls = candidate.get("photo_urls") or []
+    await send_photo_caption_or_text(
+        message=message,
+        photo_urls=photo_urls,
+        caption_text=candidate_text,
+        telegram_id=telegram_id,
+        log_prefix="candidate",
+        reply_markup=keyboard,
     )
     return True
 
@@ -330,27 +499,37 @@ async def cmd_profile_with_telegram_id(message: Message, telegram_id: int):
     
     try:
         user_data = await get_user_from_profile_service(telegram_id)
-        logger.info("got_user_data", user_data=user_data)
-
         if not user_data:
             logger.warning("user_not_found", telegram_id=telegram_id)
             await message.answer(" Профиль не найден. Нажмите /start для регистрации.")
             return
 
         profile_data = await get_profile_from_profile_service(user_data["id"])
-        logger.info("got_profile_data", profile_data=profile_data)
 
         if profile_data:
             completeness = float(profile_data.get("completeness_score", 0)) * 100
-            await message.answer(
+            first_name = escape(str(user_data.get("first_name") or "Не указано"))
+            age = escape(str(profile_data.get("age", "Не указан")))
+            gender = escape(format_gender(profile_data.get("gender")))
+            city = escape(str(profile_data.get("city", "Не указан")))
+            bio = escape(str(profile_data.get("bio", "Не указано") or "Не указано"))
+            profile_text = (
                 f"📝 <b>Ваша анкета:</b>\n\n"
                 f"Заполненность: {completeness:.0f}%\n"
-                f"Имя: {user_data.get('first_name') or 'Не указано'}\n"
-                f"Возраст: {profile_data.get('age', 'Не указан')}\n"
-                f"Пол: {format_gender(profile_data.get('gender'))}\n"
-                f"Город: {profile_data.get('city', 'Не указан')}\n"
-                f"О себе: {profile_data.get('bio', 'Не указано') or 'Не указано'}\n",
-                parse_mode=ParseMode.HTML,
+                f"Имя: {first_name}\n"
+                f"Возраст: {age}\n"
+                f"Пол: {gender}\n"
+                f"Город: {city}\n"
+                f"О себе: {bio}\n"
+            )
+
+            photo_urls = profile_data.get("photo_urls") or []
+            await send_photo_caption_or_text(
+                message=message,
+                photo_urls=photo_urls,
+                caption_text=profile_text,
+                telegram_id=telegram_id,
+                log_prefix="profile",
             )
         else:
             await message.answer(
@@ -407,7 +586,11 @@ async def process_name(message: Message, state: FSMContext):
 async def cmd_search(message: Message):
     """Запустить поиск анкеты"""
     logger.info("command_search", user_id=message.from_user.id)
-    await send_next_candidate(message, message.from_user.id)
+    if should_rate_limit_search_action(message.from_user.id):
+        await message.answer("Слишком быстро. Подождите секунду.")
+        return
+    async with get_user_action_lock(message.from_user.id):
+        await send_next_candidate(message, message.from_user.id)
 
 
 @router.message(Command("matches"))
@@ -512,30 +695,47 @@ async def process_city(message: Message, state: FSMContext):
     city = None if is_skip_command(city) else city
 
     await state.update_data(city=city)
+    await state.set_state(ProfileStates.waiting_for_photo)
+    await message.answer(
+        "📷 Отправьте фото для анкеты одним сообщением.\n"
+        "Или напишите 'пропустить', чтобы завершить без фото."
+    )
 
+
+@router.message(ProfileStates.waiting_for_photo, F.photo)
+async def process_photo(message: Message, state: FSMContext):
+    """Загрузка фото в MinIO и завершение анкеты."""
     data = await state.get_data()
-    logger.info("saving_profile", telegram_id=message.from_user.id, data=data)
+    logger.info("saving_profile_with_photo", telegram_id=message.from_user.id)
 
     user_data = await get_user_from_profile_service(message.from_user.id)
-    logger.info("got_user_data", user_data=user_data)
-
-    if user_data:
-        url = f"http://{settings.profile_service_host}:{settings.profile_service_port}/api/v1/profiles/{user_data['id']}"
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.put(url, json=data)
-                logger.info("profile_save_response", status=response.status_code, text=response.text[:200])
-                if response.status_code != 200:
-                    logger.error("failed_to_save_profile", status=response.status_code, text=response.text)
-                    await message.answer(f"⚠️ Ошибка сохранения: {response.status_code}")
-        except Exception as e:
-            logger.error("failed_to_save_profile", error=str(e))
-            await message.answer(f"⚠️ Ошибка сети: {str(e)}")
-    else:
-        logger.error("user_not_found_for_profile_save", telegram_id=message.from_user.id)
+    if not user_data:
         await message.answer("⚠️ Пользователь не найден. Нажмите /start")
+        await state.clear()
+        return
+
+    if not await save_profile_data(user_data["id"], data):
+        await message.answer("⚠️ Не удалось сохранить анкету. Попробуйте позже.")
+        await state.clear()
+        return
+
+    best_photo = message.photo[-1]
+    file = await message.bot.get_file(best_photo.file_id)
+    file_buffer = await message.bot.download_file(file.file_path)
+    photo_bytes = file_buffer.read()
+
+    uploaded = await upload_profile_photo_to_profile_service(
+        user_id=user_data["id"],
+        file_name=f"telegram_{best_photo.file_unique_id}.jpg",
+        content=photo_bytes,
+        content_type="image/jpeg",
+    )
 
     await state.clear()
+    if not uploaded:
+        await message.answer("⚠️ Анкета сохранена, но фото не загрузилось в MinIO.")
+    else:
+        await message.answer("✅ Фото загружено в MinIO и добавлено в анкету.")
 
     await message.answer(
         "✅ Анкета заполнена!\n\n"
@@ -544,6 +744,36 @@ async def process_city(message: Message, state: FSMContext):
         parse_mode=ParseMode.HTML,
     )
 
+    messages_processed.labels(service="bot_service", message_type="profile_filled").inc()
+
+
+@router.message(ProfileStates.waiting_for_photo)
+async def process_photo_skip(message: Message, state: FSMContext):
+    """Пропуск шага загрузки фото и завершение анкеты."""
+    text = (message.text or "").strip()
+    if not is_skip_command(text):
+        await message.answer("Отправьте фото или напишите 'пропустить'.")
+        return
+
+    data = await state.get_data()
+    user_data = await get_user_from_profile_service(message.from_user.id)
+    if not user_data:
+        await message.answer("⚠️ Пользователь не найден. Нажмите /start")
+        await state.clear()
+        return
+
+    if not await save_profile_data(user_data["id"], data):
+        await message.answer("⚠️ Не удалось сохранить анкету. Попробуйте позже.")
+        await state.clear()
+        return
+
+    await state.clear()
+    await message.answer(
+        "✅ Анкета заполнена без фото.\n\n"
+        "Теперь вы можете начать поиск пары! 💕\n"
+        "Нажмите /search или используйте кнопку в меню.",
+        parse_mode=ParseMode.HTML,
+    )
     messages_processed.labels(service="bot_service", message_type="profile_filled").inc()
 
 
@@ -573,6 +803,9 @@ async def cb_fill_profile(callback: CallbackQuery, state: FSMContext):
 async def cb_search(callback: CallbackQuery):
     """Начать поиск"""
     logger.info("callback_search", user_id=callback.from_user.id)
+    if should_rate_limit_search_action(callback.from_user.id):
+        await callback.answer("Слишком быстро. Подождите секунду.", show_alert=False)
+        return
 
     user_data = await get_user_from_profile_service(callback.from_user.id)
     if not user_data:
@@ -586,7 +819,8 @@ async def cb_search(callback: CallbackQuery):
         return
 
     await callback.message.answer("🔍 Ищу анкету для вас...")
-    await send_next_candidate(callback.message, callback.from_user.id)
+    async with get_user_action_lock(callback.from_user.id):
+        await send_next_candidate(callback.message, callback.from_user.id)
     await callback.answer()
 
 
@@ -606,6 +840,12 @@ async def cb_rate_profile(callback: CallbackQuery):
         return
 
     _, action, profile_id_raw = parts
+    if should_rate_limit_search_action(callback.from_user.id):
+        await callback.answer("Слишком быстро. Подождите секунду.", show_alert=False)
+        return
+
+    await callback.answer("Сохраняю реакцию...")
+
     if action not in {"like", "pass"}:
         await callback.answer("Неизвестное действие", show_alert=True)
         return
@@ -616,26 +856,31 @@ async def cb_rate_profile(callback: CallbackQuery):
         await callback.answer("Некорректный id анкеты", show_alert=True)
         return
 
+    if is_duplicate_rate_action(callback.from_user.id, profile_id, action):
+        await callback.answer("Уже обработано", show_alert=False)
+        return
+
     user_data = await get_user_from_profile_service(callback.from_user.id)
     if not user_data:
         await callback.answer("Сначала нажмите /start", show_alert=True)
         return
 
-    interaction_result = await send_interaction_to_profile_service(
-        actor_user_id=user_data["id"],
-        target_profile_id=profile_id,
-        action=action,
-    )
-    if not interaction_result:
-        await callback.answer("Ошибка отправки реакции", show_alert=True)
-        return
+    async with get_user_action_lock(callback.from_user.id):
+        interaction_result = await send_interaction_to_profile_service(
+            actor_user_id=user_data["id"],
+            target_profile_id=profile_id,
+            action=action,
+        )
+        if not interaction_result:
+            await callback.answer("Ошибка отправки реакции", show_alert=True)
+            return
 
-    if interaction_result.get("is_match"):
-        await callback.message.answer("🎉 Взаимный лайк! У вас мэтч!")
-    else:
-        await callback.answer("Реакция сохранена")
+        if interaction_result.get("is_match"):
+            await callback.message.answer("🎉 Взаимный лайк! У вас мэтч!")
+        else:
+            await callback.answer("Реакция сохранена")
 
-    await send_next_candidate(callback.message, callback.from_user.id)
+        await send_next_candidate(callback.message, callback.from_user.id)
 
 
 @router.callback_query(F.data == "settings")
@@ -695,7 +940,11 @@ async def main():
     logger.info("bot_starting", bot_id=(await bot.get_me()).id)
     
     # Запуск polling
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await close_http_client()
+        await bot.session.close()
 
 
 if __name__ == "__main__":
