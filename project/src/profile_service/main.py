@@ -12,12 +12,19 @@ from sqlalchemy import select, delete, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.database import get_db, init_db
+from common.event_publisher import (
+    init_event_publisher,
+    publish_domain_event,
+    shutdown_event_publisher,
+)
 from common.logging_config import setup_logging, get_logger
 from common.metrics import (
     user_registrations_total,
     track_request_duration,
     cached_profiles,
     rating_calculation_duration,
+    get_metrics,
+    get_metrics_content_type,
 )
 from common.models import User, Profile, Preferences, Rating, Interaction
 from common.config import get_settings
@@ -128,6 +135,8 @@ class InteractionRequest(BaseModel):
 class MatchProfileResponse(BaseModel):
     profile_id: int
     user_id: int
+    telegram_id: int
+    username: Optional[str]
     first_name: Optional[str]
     age: Optional[int]
     gender: Optional[str]
@@ -167,13 +176,15 @@ def normalize_decimal(value: Decimal | float | int | None) -> float:
 
 
 def calculate_primary_score(profile: Profile) -> float:
-    profile_fields_completeness = (
-        (0.25 if profile.bio else 0.0)
-        + (0.25 if profile.age else 0.0)
-        + (0.25 if profile.gender else 0.0)
-        + (0.25 if profile.city else 0.0)
+    """Первичный рейтинг: био, возраст, пол, город и наличие фото (по ТЗ)."""
+    parts = (
+        (0.2 if profile.bio else 0.0)
+        + (0.2 if profile.age else 0.0)
+        + (0.2 if profile.gender else 0.0)
+        + (0.2 if profile.city else 0.0)
+        + (0.2 if (profile.photo_urls and len(profile.photo_urls) > 0) else 0.0)
     )
-    score = profile_fields_completeness * 100
+    score = parts * 100
     return round(score, 2)
 
 
@@ -830,10 +841,33 @@ async def create_interaction(
 
     await invalidate_discovery_cache(request.actor_user_id)
 
+    match_partner = None
+    if is_match:
+        target_user_result = await session.execute(select(User).where(User.id == target_profile.user_id))
+        target_user = target_user_result.scalar_one_or_none()
+        if target_user is not None:
+            match_partner = {
+                "telegram_id": int(target_user.telegram_id),
+                "username": target_user.username,
+                "first_name": (target_user.first_name or "").strip() or "Новый знакомый",
+            }
+            await publish_domain_event(
+                "match.created",
+                {
+                    "actor_telegram_id": int(actor.telegram_id),
+                    "target_telegram_id": int(target_user.telegram_id),
+                    "partner_name_for_actor": match_partner["first_name"],
+                    "partner_name_for_target": (actor.first_name or "").strip() or "Новый знакомый",
+                    "partner_username_for_actor": target_user.username,
+                    "partner_username_for_target": actor.username,
+                },
+            )
+
     return {
         "status": "ok",
         "is_match": is_match,
         "target_profile_id": request.target_profile_id,
+        "match_partner": match_partner,
         "updated_rating": {
             "primary_score": normalize_decimal(target_rating.primary_score),
             "behavioral_score": normalize_decimal(target_rating.behavioral_score),
@@ -854,7 +888,7 @@ async def get_matches(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Пользователь не найден")
 
     query = (
-        select(Interaction, Profile, User.first_name)
+        select(Interaction, Profile, User)
         .join(Profile, Profile.id == Interaction.target_profile_id)
         .join(User, User.id == Profile.user_id)
         .where(Interaction.actor_user_id == user_id)
@@ -865,13 +899,15 @@ async def get_matches(
 
     # Защищаемся от дубликатов (если пользователь повторно ставил лайк той же анкете).
     unique_matches: dict[int, MatchProfileResponse] = {}
-    for interaction, profile, first_name in rows:
+    for interaction, profile, partner_user in rows:
         if profile.id in unique_matches:
             continue
         unique_matches[profile.id] = MatchProfileResponse(
             profile_id=profile.id,
             user_id=profile.user_id,
-            first_name=first_name,
+            telegram_id=int(partner_user.telegram_id),
+            username=partner_user.username,
+            first_name=partner_user.first_name,
             age=profile.age,
             gender=profile.gender,
             city=profile.city,
@@ -884,12 +920,11 @@ async def get_matches(
 
 @app.get("/metrics")
 async def get_prometheus_metrics():
-    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
     from fastapi.responses import Response
 
     return Response(
-        content=generate_latest(),
-        media_type=CONTENT_TYPE_LATEST,
+        content=get_metrics(),
+        media_type=get_metrics_content_type(),
     )
 
 
@@ -923,6 +958,8 @@ async def startup_event():
         logger.error("minio_connection_failed", error=str(exc))
         minio_client = None
 
+    await init_event_publisher(settings.rabbitmq_amqp_url)
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -930,6 +967,7 @@ async def shutdown_event():
     logger.info("profile_service_shutdown")
     if redis_client is not None:
         await redis_client.close()
+    await shutdown_event_publisher()
     await close_db()
 
 

@@ -66,6 +66,24 @@ services:
       timeout: 5s
       retries: 5
 
+  event_consumer:
+    image: python:3.11-slim
+    container_name: dating_event_consumer
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_USER: dating_user
+      RABBITMQ_PASSWORD: dating_password
+      BOT_TOKEN: ${BOT_TOKEN:-}
+    volumes:
+      - ./src:/app/src
+    working_dir: /app
+    command: >
+      sh -c "pip install --no-cache-dir -q -r /app/src/event_consumer/requirements.txt &&
+      PYTHONPATH=/app/src exec python -m event_consumer.main"
+
 volumes:
   postgres_data:
   redis_data:

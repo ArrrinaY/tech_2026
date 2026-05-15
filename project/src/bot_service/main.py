@@ -21,6 +21,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramNetworkError
 import httpx
 
 from common.logging_config import setup_logging, get_logger
@@ -164,7 +165,10 @@ class ProfileStates(StatesGroup):
     waiting_for_bio = State()
     waiting_for_age = State()
     waiting_for_gender = State()
+    waiting_for_partner_gender = State()
+    waiting_for_age_pref = State()
     waiting_for_city = State()
+    waiting_for_city_pref = State()
     waiting_for_photo = State()
 
 
@@ -314,6 +318,176 @@ async def save_profile_data(user_id: int, data: dict) -> bool:
         return False
 
 
+async def save_preferences_in_profile_service(user_id: int, **fields) -> bool:
+    """Сохраняет предпочтения поиска (передаются только изменяемые поля)."""
+    url = f"{PROFILE_SERVICE_BASE_URL}/api/v1/preferences"
+    payload = {"user_id": user_id, **fields}
+    try:
+        response = await get_http_client().post(url, json=payload)
+        if response.status_code == 200:
+            return True
+        logger.error("failed_to_save_preferences", status=response.status_code, text=response.text)
+        return False
+    except Exception as exc:
+        logger.error("failed_to_save_preferences", error=str(exc))
+        return False
+
+
+def get_own_gender_keyboard() -> InlineKeyboardMarkup:
+    """Кнопки выбора своего пола."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👨 Мужской", callback_data="own_gender:мужской"),
+                InlineKeyboardButton(text="👩 Женский", callback_data="own_gender:женский"),
+            ],
+            [InlineKeyboardButton(text="🧑 Другой", callback_data="own_gender:другой")],
+        ]
+    )
+
+
+def get_partner_gender_keyboard() -> InlineKeyboardMarkup:
+    """Кнопки выбора, кого искать в поиске."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👨 Мужчин", callback_data="pref_gender:мужской"),
+                InlineKeyboardButton(text="👩 Женщин", callback_data="pref_gender:женский"),
+            ],
+            [InlineKeyboardButton(text="👥 Всех", callback_data="pref_gender:any")],
+        ]
+    )
+
+
+PARTNER_GENDER_LABELS = {
+    "мужской": "мужчин",
+    "женский": "женщин",
+    "any": "всех",
+}
+
+AGE_RANGE_PRESETS: dict[str, tuple[int, int]] = {
+    "18-25": (18, 25),
+    "26-35": (26, 35),
+    "36-45": (36, 45),
+    "46+": (46, 99),
+    "any": (18, 99),
+}
+
+AGE_RANGE_LABELS = {
+    "18-25": "18–25 лет",
+    "26-35": "26–35 лет",
+    "36-45": "36–45 лет",
+    "46+": "46+ лет",
+    "any": "любой возраст (18–99)",
+}
+
+
+def get_age_pref_keyboard(*, callback_prefix: str = "pref_age") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="18–25", callback_data=f"{callback_prefix}:18-25"),
+                InlineKeyboardButton(text="26–35", callback_data=f"{callback_prefix}:26-35"),
+            ],
+            [
+                InlineKeyboardButton(text="36–45", callback_data=f"{callback_prefix}:36-45"),
+                InlineKeyboardButton(text="46+", callback_data=f"{callback_prefix}:46+"),
+            ],
+            [InlineKeyboardButton(text="🎂 Любой возраст", callback_data=f"{callback_prefix}:any")],
+        ]
+    )
+
+
+def get_city_pref_keyboard(profile_city: str | None, *, callback_prefix: str = "pref_city") -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if profile_city:
+        rows.append([
+            InlineKeyboardButton(
+                text=f"📍 Только {profile_city}",
+                callback_data=f"{callback_prefix}:mine",
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="🌍 Любой город", callback_data=f"{callback_prefix}:any")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def get_settings_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💕 Кого ищу", callback_data="settings:gender")],
+            [InlineKeyboardButton(text="🎂 Возраст партнёра", callback_data="settings:age")],
+            [InlineKeyboardButton(text="📍 Город в поиске", callback_data="settings:city")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="back")],
+        ]
+    )
+
+
+async def prompt_age_pref(message: Message, state: FSMContext) -> None:
+    await state.set_state(ProfileStates.waiting_for_age_pref)
+    await message.answer(
+        "🎂 <b>Возраст в поиске</b>\n\n"
+        "Выберите возрастной диапазон анкет:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_age_pref_keyboard(),
+    )
+
+
+async def prompt_city_pref(message: Message, state: FSMContext, profile_city: str | None) -> None:
+    await state.set_state(ProfileStates.waiting_for_city_pref)
+    hint = (
+        f"Можно искать только в городе <b>{escape(profile_city)}</b> или по всем городам."
+        if profile_city
+        else "Укажите, ограничивать ли поиск вашим городом."
+    )
+    await message.answer(
+        f"📍 <b>Город в поиске</b>\n\n{hint}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_city_pref_keyboard(profile_city),
+    )
+
+
+async def apply_age_pref_choice(
+    user_id: int,
+    choice: str,
+    state: FSMContext | None = None,
+) -> tuple[bool, str]:
+    if choice not in AGE_RANGE_PRESETS:
+        return False, ""
+    age_min, age_max = AGE_RANGE_PRESETS[choice]
+    if state is not None:
+        await state.update_data(age_min=age_min, age_max=age_max)
+    ok = await save_preferences_in_profile_service(user_id, age_min=age_min, age_max=age_max)
+    return ok, AGE_RANGE_LABELS[choice]
+
+
+async def apply_city_pref_choice(
+    user_id: int,
+    choice: str,
+    profile_city: str | None,
+    state: FSMContext | None = None,
+) -> tuple[bool, str]:
+    if choice not in {"mine", "any"}:
+        return False, ""
+    city_pref = profile_city if choice == "mine" and profile_city else None
+    if choice == "mine" and not profile_city:
+        return False, ""
+    if state is not None:
+        await state.update_data(city_pref=city_pref)
+    ok = await save_preferences_in_profile_service(user_id, city_pref=city_pref)
+    label = f"только {profile_city}" if city_pref else "любой город"
+    return ok, label
+
+
+async def prompt_partner_gender(message: Message, state: FSMContext) -> None:
+    await state.set_state(ProfileStates.waiting_for_partner_gender)
+    await message.answer(
+        "💕 <b>Кого вы ищете?</b>\n\n"
+        "Выберите, какие анкеты показывать в поиске:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_partner_gender_keyboard(),
+    )
+
+
 async def upload_profile_photo_to_profile_service(
     user_id: int,
     file_name: str,
@@ -334,6 +508,22 @@ async def upload_profile_photo_to_profile_service(
         return False
 
 
+def format_user_chat_link(
+    telegram_id: int | None,
+    display_name: str,
+    username: str | None = None,
+) -> str:
+    """HTML-ссылка на чат с пользователем в Telegram."""
+    safe_name = escape(display_name or "Новый знакомый")
+    if username:
+        uname = username.lstrip("@")
+        if uname.replace("_", "").isalnum():
+            return f'<a href="https://t.me/{uname}">{safe_name}</a>'
+    if telegram_id is not None:
+        return f'<a href="tg://user?id={telegram_id}">{safe_name}</a>'
+    return safe_name
+
+
 def format_gender(gender: str | None) -> str:
     """Преобразует значение пола в русскоязычный формат."""
     if not gender:
@@ -349,6 +539,120 @@ def format_gender(gender: str | None) -> str:
         "другой": "Другой",
     }
     return gender_map.get(normalized, gender)
+
+
+def gender_emoji(gender: str | None) -> str:
+    normalized = (gender or "").strip().lower()
+    if normalized in {"female", "женский", "ж"}:
+        return "👩"
+    if normalized in {"male", "мужской", "м"}:
+        return "👨"
+    return "🧑"
+
+
+def format_progress_bar(percent: float, width: int = 10) -> str:
+    percent = max(0.0, min(100.0, percent))
+    filled = int(round(percent / 100 * width))
+    return "▰" * filled + "▱" * (width - filled)
+
+
+def normalize_rating_for_display(score: float) -> float:
+    """В БД рейтинг 0–100, в боте показываем шкалу 0–10."""
+    value = max(0.0, float(score or 0))
+    if value <= 10:
+        return round(value, 1)
+    return round(value / 10, 1)
+
+
+def format_score_stars(score_on_10: float) -> str:
+    score_on_10 = max(0.0, min(10.0, score_on_10))
+    filled = int(round(score_on_10 / 10 * 5))
+    filled = max(0, min(5, filled))
+    return "★" * filled + "☆" * (5 - filled)
+
+
+def _display_value(value: str | int | None, *, empty: str = "—") -> str:
+    if value is None:
+        return empty
+    text = str(value).strip()
+    return escape(text) if text else empty
+
+
+def _format_age(age: str | int | None) -> str:
+    if age is None:
+        return "возраст не указан"
+    if isinstance(age, int):
+        return f"{age} лет"
+    text = str(age).strip()
+    if not text:
+        return "возраст не указан"
+    if text.isdigit():
+        return f"{text} лет"
+    return escape(text)
+
+
+def format_profile_card(
+    *,
+    title: str,
+    first_name: str,
+    age: str | int | None,
+    gender: str | None,
+    city: str | None,
+    bio: str | None,
+    completeness: float | None = None,
+    rating: dict | None = None,
+    show_rating_details: bool = False,
+) -> str:
+    """Красивое HTML-оформление анкеты для Telegram."""
+    name = escape(first_name or "Без имени")
+    age_text = _format_age(age)
+    city_text = _display_value(city, empty="город не указан")
+    gender_text = escape(format_gender(gender))
+    g_emoji = gender_emoji(gender)
+    bio_raw = (bio or "").strip()
+    bio_text = escape(bio_raw) if bio_raw else "<i>пока ничего не написано</i>"
+
+    lines = [
+        f"{title}",
+        "━━━━━━━━━━━━━━━━",
+        f"👤 <b>{name}</b>",
+        f"🎂 {age_text}  ·  {g_emoji} {gender_text}",
+        f"📍 {city_text}",
+        "━━━━━━━━━━━━━━━━",
+        f"💬 <b>О себе</b>",
+        bio_text,
+    ]
+
+    if completeness is not None:
+        pct = max(0.0, min(100.0, completeness))
+        bar = format_progress_bar(pct)
+        lines.extend([
+            "━━━━━━━━━━━━━━━━",
+            f"📊 <b>Заполненность:</b> {pct:.0f}%",
+            f"<code>{bar}</code>",
+        ])
+
+    if rating and show_rating_details:
+        combined_raw = float(rating.get("combined_score") or 0)
+        primary = float(rating.get("primary_score") or 0)
+        behavioral = float(rating.get("behavioral_score") or 0)
+        combined_10 = normalize_rating_for_display(combined_raw)
+        stars = format_score_stars(combined_10)
+        lines.extend([
+            "━━━━━━━━━━━━━━━━",
+            f"⭐ <b>Рейтинг анкеты:</b> {combined_10:.1f}/10  {stars}",
+            f"<i>заполненность {primary:.0f}/100 · отклики {behavioral:.0f}/100</i>",
+        ])
+    elif rating:
+        combined_raw = float(rating.get("combined_score") or 0)
+        combined_10 = normalize_rating_for_display(combined_raw)
+        stars = format_score_stars(combined_10)
+        lines.extend([
+            "━━━━━━━━━━━━━━━━",
+            f"⭐ <b>Рейтинг анкеты:</b> {combined_10:.1f}/10  {stars}",
+        ])
+
+    return "\n".join(lines)
 
 
 def get_search_keyboard(profile_id: int) -> InlineKeyboardMarkup:
@@ -378,21 +682,15 @@ async def send_next_candidate(message: Message, telegram_id: int) -> bool:
         )
         return False
 
-    rating = candidate.get("rating", {})
-    first_name = escape(str(candidate.get("first_name") or "Не указано"))
-    age = escape(str(candidate.get("age", "Не указан")))
-    gender = escape(format_gender(candidate.get("gender")))
-    city = escape(str(candidate.get("city", "Не указан")))
-    bio = escape(str(candidate.get("bio") or "Не указано"))
-    candidate_text = (
-        "💘 <b>Найдена анкета</b>\n\n"
-        f"Имя: {first_name}\n"
-        f"Возраст: {age}\n"
-        f"Пол: {gender}\n"
-        f"Город: {city}\n"
-        f"О себе: {bio}\n\n"
-        f"Рейтинг анкеты: {rating.get('combined_score', 0):.1f}\n"
-        f"(первичный: {rating.get('primary_score', 0):.1f}, поведенческий: {rating.get('behavioral_score', 0):.1f})"
+    candidate_text = format_profile_card(
+        title="💘 <b>Новая анкета</b>",
+        first_name=str(candidate.get("first_name") or "Без имени"),
+        age=candidate.get("age"),
+        gender=candidate.get("gender"),
+        city=candidate.get("city"),
+        bio=candidate.get("bio"),
+        rating=candidate.get("rating"),
+        show_rating_details=False,
     )
     keyboard = get_search_keyboard(candidate["profile_id"])
 
@@ -415,6 +713,7 @@ def get_main_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="👤 Моя анкета", callback_data="my_profile")],
         [InlineKeyboardButton(text="💞 Мои мэтчи", callback_data="matches")],
         [InlineKeyboardButton(text="🔍 Поиск пары", callback_data="search")],
+        [InlineKeyboardButton(text="⚙️ Настройки поиска", callback_data="settings")],
     ])
     return keyboard
 
@@ -508,19 +807,14 @@ async def cmd_profile_with_telegram_id(message: Message, telegram_id: int):
 
         if profile_data:
             completeness = float(profile_data.get("completeness_score", 0)) * 100
-            first_name = escape(str(user_data.get("first_name") or "Не указано"))
-            age = escape(str(profile_data.get("age", "Не указан")))
-            gender = escape(format_gender(profile_data.get("gender")))
-            city = escape(str(profile_data.get("city", "Не указан")))
-            bio = escape(str(profile_data.get("bio", "Не указано") or "Не указано"))
-            profile_text = (
-                f"📝 <b>Ваша анкета:</b>\n\n"
-                f"Заполненность: {completeness:.0f}%\n"
-                f"Имя: {first_name}\n"
-                f"Возраст: {age}\n"
-                f"Пол: {gender}\n"
-                f"Город: {city}\n"
-                f"О себе: {bio}\n"
+            profile_text = format_profile_card(
+                title="✨ <b>Ваша анкета</b>",
+                first_name=str(user_data.get("first_name") or "Без имени"),
+                age=profile_data.get("age"),
+                gender=profile_data.get("gender"),
+                city=profile_data.get("city"),
+                bio=profile_data.get("bio"),
+                completeness=completeness,
             )
 
             photo_urls = profile_data.get("photo_urls") or []
@@ -614,13 +908,20 @@ async def cmd_matches_with_telegram_id(message: Message, telegram_id: int):
         await message.answer("Пока мэтчей нет. Продолжайте ставить лайки в поиске 💘")
         return
 
-    lines = ["💞 <b>Ваши мэтчи:</b>\n"]
+    lines = ["💞 <b>Ваши мэтчи</b>", "━━━━━━━━━━━━━━━━", ""]
     for idx, match in enumerate(matches, start=1):
-        lines.append(
-            f"{idx}. {match.get('first_name') or 'Без имени'}, "
-            f"{match.get('age', 'возраст не указан')} — {match.get('city') or 'город не указан'}"
+        name = format_user_chat_link(
+            match.get("telegram_id"),
+            match.get("first_name") or "Без имени",
+            match.get("username"),
         )
-    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+        age = match.get("age", "—")
+        city = escape(str(match.get("city") or "город не указан"))
+        g_emoji = gender_emoji(match.get("gender"))
+        lines.append(f"<b>{idx}.</b> {name}")
+        lines.append(f"   {g_emoji} {age} лет  ·  📍 {city}")
+        lines.append("")
+    await message.answer("\n".join(lines).strip(), parse_mode=ParseMode.HTML)
 
 
 def is_skip_command(text: str) -> bool:
@@ -659,46 +960,175 @@ async def process_age(message: Message, state: FSMContext):
     
     await state.update_data(age=age)
     await state.set_state(ProfileStates.waiting_for_gender)
-    
+
     await message.answer(
-        "Ваш пол:\n"
-        "1. Мужской\n"
-        "2. Женский\n"
-        "3. Другой\n\n"
-        "(отправьте номер варианта)"
+        "🪪 <b>Ваш пол</b>\n\n"
+        "Выберите вариант на кнопках ниже:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_own_gender_keyboard(),
     )
+
+
+@router.callback_query(ProfileStates.waiting_for_gender, F.data.startswith("own_gender:"))
+async def cb_own_gender(callback: CallbackQuery, state: FSMContext):
+    """Выбор своего пола кнопкой."""
+    gender = (callback.data or "").split(":", 1)[-1]
+    if gender not in {"мужской", "женский", "другой"}:
+        await callback.answer("Некорректный выбор", show_alert=True)
+        return
+
+    await state.update_data(gender=gender)
+    await callback.answer("Сохранено")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await prompt_partner_gender(callback.message, state)
 
 
 @router.message(ProfileStates.waiting_for_gender)
 async def process_gender(message: Message, state: FSMContext):
-    """Обработка пола"""
+    """Обработка пола (текстом, если кнопки не нажали)."""
     gender_map = {"1": "мужской", "2": "женский", "3": "другой"}
-    gender = gender_map.get(message.text.strip())
-    
+    gender = gender_map.get((message.text or "").strip())
+
     if not gender:
-        await message.answer(" Выберите 1, 2 или 3:")
+        await message.answer(
+            "Выберите пол на кнопках ниже или отправьте 1, 2 или 3:",
+            reply_markup=get_own_gender_keyboard(),
+        )
         return
-    
+
     await state.update_data(gender=gender)
-    await state.set_state(ProfileStates.waiting_for_city)
-    
+    await prompt_partner_gender(message, state)
+
+
+@router.callback_query(ProfileStates.waiting_for_partner_gender, F.data.startswith("pref_gender:"))
+async def cb_partner_gender(callback: CallbackQuery, state: FSMContext):
+    """Выбор, кого показывать в поиске."""
+    choice = (callback.data or "").split(":", 1)[-1]
+    if choice not in PARTNER_GENDER_LABELS:
+        await callback.answer("Некорректный выбор", show_alert=True)
+        return
+
+    gender_pref = None if choice == "any" else choice
+    await state.update_data(partner_gender_pref=gender_pref)
+
+    user_data = await get_user_from_profile_service(callback.from_user.id)
+    if not user_data:
+        await callback.answer("Сначала нажмите /start", show_alert=True)
+        await state.clear()
+        return
+
+    if not await save_preferences_in_profile_service(user_data["id"], gender_pref=gender_pref):
+        await callback.answer("Не удалось сохранить предпочтения", show_alert=True)
+        return
+
+    label = PARTNER_GENDER_LABELS[choice]
+    await callback.answer(f"Ищем: {label}")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await callback.message.answer(f"✅ В поиске: <b>{label}</b>", parse_mode=ParseMode.HTML)
+    await prompt_age_pref(callback.message, state)
+
+
+@router.message(ProfileStates.waiting_for_partner_gender)
+async def process_partner_gender_text(message: Message, state: FSMContext):
+    """Напоминание выбрать кнопку «кого ищете»."""
     await message.answer(
-        "Ваш город:\n"
-        "(или 'пропустить')"
+        "Пожалуйста, выберите вариант на кнопках 👇",
+        reply_markup=get_partner_gender_keyboard(),
     )
+
+
+@router.callback_query(ProfileStates.waiting_for_age_pref, F.data.startswith("pref_age:"))
+async def cb_age_pref_fill(callback: CallbackQuery, state: FSMContext):
+    choice = (callback.data or "").split(":", 1)[-1]
+    user_data = await get_user_from_profile_service(callback.from_user.id)
+    if not user_data:
+        await callback.answer("Сначала /start", show_alert=True)
+        await state.clear()
+        return
+
+    ok, label = await apply_age_pref_choice(user_data["id"], choice, state)
+    if not ok:
+        await callback.answer("Некорректный выбор или ошибка сохранения", show_alert=True)
+        return
+
+    await callback.answer(label)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await state.set_state(ProfileStates.waiting_for_city)
+    await callback.message.answer(
+        f"✅ Возраст в поиске: <b>{escape(label)}</b>\n\n"
+        "📍 <b>Ваш город</b> (для анкеты)\n"
+        "Напишите город или «пропустить».",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(ProfileStates.waiting_for_age_pref)
+async def process_age_pref_text(message: Message, state: FSMContext):
+    await message.answer("Выберите возраст на кнопках 👇", reply_markup=get_age_pref_keyboard())
 
 
 @router.message(ProfileStates.waiting_for_city)
 async def process_city(message: Message, state: FSMContext):
     """Обработка города"""
-    city = message.text.strip()
+    city = (message.text or "").strip()
     city = None if is_skip_command(city) else city
 
     await state.update_data(city=city)
+    await prompt_city_pref(message, state, city)
+
+
+@router.callback_query(ProfileStates.waiting_for_city_pref, F.data.startswith("pref_city:"))
+async def cb_city_pref_fill(callback: CallbackQuery, state: FSMContext):
+    choice = (callback.data or "").split(":", 1)[-1]
+    data = await state.get_data()
+    profile_city = data.get("city")
+
+    user_data = await get_user_from_profile_service(callback.from_user.id)
+    if not user_data:
+        await callback.answer("Сначала /start", show_alert=True)
+        await state.clear()
+        return
+
+    ok, label = await apply_city_pref_choice(user_data["id"], choice, profile_city, state)
+    if not ok:
+        await callback.answer(
+            "Укажите город в анкете или выберите «Любой город»",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer(label)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
     await state.set_state(ProfileStates.waiting_for_photo)
-    await message.answer(
+    await callback.message.answer(
+        f"✅ Город в поиске: <b>{escape(label)}</b>\n\n"
         "📷 Отправьте фото для анкеты одним сообщением.\n"
-        "Или напишите 'пропустить', чтобы завершить без фото."
+        "Или напишите «пропустить», чтобы завершить без фото.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(ProfileStates.waiting_for_city_pref)
+async def process_city_pref_text(message: Message, state: FSMContext):
+    data = await state.get_data()
+    await message.answer(
+        "Выберите вариант на кнопках 👇",
+        reply_markup=get_city_pref_keyboard(data.get("city")),
     )
 
 
@@ -876,7 +1306,17 @@ async def cb_rate_profile(callback: CallbackQuery):
             return
 
         if interaction_result.get("is_match"):
-            await callback.message.answer("🎉 Взаимный лайк! У вас мэтч!")
+            partner = interaction_result.get("match_partner") or {}
+            partner_link = format_user_chat_link(
+                partner.get("telegram_id"),
+                partner.get("first_name") or "Новый знакомый",
+                partner.get("username"),
+            )
+            await callback.message.answer(
+                f"🎉 Взаимный лайк! У вас мэтч с {partner_link}!\n"
+                "Нажмите на имя, чтобы написать в Telegram.",
+                parse_mode=ParseMode.HTML,
+            )
         else:
             await callback.answer("Реакция сохранена")
 
@@ -885,21 +1325,145 @@ async def cb_rate_profile(callback: CallbackQuery):
 
 @router.callback_query(F.data == "settings")
 async def cb_settings(callback: CallbackQuery):
-    """Настройки"""
+    """Настройки поиска"""
     logger.info("callback_settings", user_id=callback.from_user.id)
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="back")],
-    ])
-    
     await callback.message.answer(
-        "⚙️ <b>Настройки</b>\n\n"
-        "Здесь вы сможете настроить предпочтения для поиска.\n"
-        "(Функционал в разработке)",
+        "⚙️ <b>Настройки поиска</b>\n\n"
+        "Выберите, что хотите изменить:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_settings_menu_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "settings:gender")
+async def cb_settings_gender_menu(callback: CallbackQuery):
+    await callback.message.answer(
+        "💕 <b>Кого показывать в поиске?</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_partner_gender_keyboard_for_settings(),
+    )
+    await callback.answer()
+
+
+def get_partner_gender_keyboard_for_settings() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👨 Мужчин", callback_data="set_gender:мужской"),
+                InlineKeyboardButton(text="👩 Женщин", callback_data="set_gender:женский"),
+            ],
+            [InlineKeyboardButton(text="👥 Всех", callback_data="set_gender:any")],
+            [InlineKeyboardButton(text="🔙 К настройкам", callback_data="settings")],
+        ]
+    )
+
+
+@router.callback_query(F.data.startswith("set_gender:"))
+async def cb_settings_gender_save(callback: CallbackQuery):
+    choice = (callback.data or "").split(":", 1)[-1]
+    if choice not in PARTNER_GENDER_LABELS:
+        await callback.answer("Некорректный выбор", show_alert=True)
+        return
+
+    user_data = await get_user_from_profile_service(callback.from_user.id)
+    if not user_data:
+        await callback.answer("Сначала /start", show_alert=True)
+        return
+
+    gender_pref = None if choice == "any" else choice
+    if not await save_preferences_in_profile_service(user_data["id"], gender_pref=gender_pref):
+        await callback.answer("Ошибка сохранения", show_alert=True)
+        return
+
+    await callback.answer("Сохранено")
+    await callback.message.answer(
+        f"✅ Теперь в поиске: <b>{PARTNER_GENDER_LABELS[choice]}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_settings_menu_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "settings:age")
+async def cb_settings_age_menu(callback: CallbackQuery):
+    await callback.message.answer(
+        "🎂 <b>Возраст партнёра в поиске</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_age_pref_keyboard(callback_prefix="set_age"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("set_age:"))
+async def cb_settings_age_save(callback: CallbackQuery):
+    choice = (callback.data or "").split(":", 1)[-1]
+    user_data = await get_user_from_profile_service(callback.from_user.id)
+    if not user_data:
+        await callback.answer("Сначала /start", show_alert=True)
+        return
+
+    ok, label = await apply_age_pref_choice(user_data["id"], choice)
+    if not ok:
+        await callback.answer("Ошибка сохранения", show_alert=True)
+        return
+
+    await callback.answer("Сохранено")
+    await callback.message.answer(
+        f"✅ Возраст в поиске: <b>{escape(label)}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_settings_menu_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "settings:city")
+async def cb_settings_city_menu(callback: CallbackQuery):
+    user_data = await get_user_from_profile_service(callback.from_user.id)
+    if not user_data:
+        await callback.answer("Сначала /start", show_alert=True)
+        return
+
+    profile = await get_profile_from_profile_service(user_data["id"])
+    profile_city = (profile or {}).get("city")
+
+    keyboard = get_city_pref_keyboard(profile_city, callback_prefix="set_city")
+    rows = list(keyboard.inline_keyboard)
+    rows.append([InlineKeyboardButton(text="🔙 К настройкам", callback_data="settings")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
+
+    await callback.message.answer(
+        "📍 <b>Город в поиске</b>\n\n"
+        "Ограничить выдачу по городу или показывать всех:",
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
     )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("set_city:"))
+async def cb_settings_city_save(callback: CallbackQuery):
+    choice = (callback.data or "").split(":", 1)[-1]
+    user_data = await get_user_from_profile_service(callback.from_user.id)
+    if not user_data:
+        await callback.answer("Сначала /start", show_alert=True)
+        return
+
+    profile = await get_profile_from_profile_service(user_data["id"])
+    profile_city = (profile or {}).get("city")
+
+    ok, label = await apply_city_pref_choice(user_data["id"], choice, profile_city)
+    if not ok:
+        await callback.answer(
+            "Сначала укажите город в анкете или выберите «Любой город»",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer("Сохранено")
+    await callback.message.answer(
+        f"✅ Город в поиске: <b>{escape(label)}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_settings_menu_keyboard(),
+    )
 
 
 @router.callback_query(F.data == "back")
@@ -935,9 +1499,20 @@ async def main():
     
     # Регистрация роутера
     dp.include_router(router)
-    await setup_bot_commands(bot)
-    
-    logger.info("bot_starting", bot_id=(await bot.get_me()).id)
+    try:
+        await setup_bot_commands(bot)
+    except TelegramNetworkError as e:
+        logger.warning(
+            "setup_bot_commands_skipped_network",
+            error=str(e),
+            hint="Проверьте доступ к api.telegram.org (VPN/файрвол). Бот продолжит без меню команд.",
+        )
+
+    try:
+        me = await bot.get_me()
+        logger.info("bot_starting", bot_id=me.id)
+    except TelegramNetworkError as e:
+        logger.warning("bot_get_me_failed", error=str(e))
     
     # Запуск polling
     try:

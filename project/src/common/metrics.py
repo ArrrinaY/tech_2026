@@ -73,6 +73,13 @@ cached_profiles = Gauge(
     registry=registry
 )
 
+domain_events_published_total = Counter(
+    'domain_events_published_total',
+    'Domain events published to RabbitMQ (non-Celery topic exchange)',
+    ['event_type'],
+    registry=registry
+)
+
 
 def track_request_duration(service: str, endpoint: str):
     def decorator(func):

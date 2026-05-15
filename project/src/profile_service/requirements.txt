@@ -15,3 +15,4 @@ pytest
 pytest-asyncio
 minio
 python-multipart
+aio-pika==9.4.1

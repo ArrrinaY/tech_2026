@@ -1,6 +1,7 @@
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import quote
 import os
 
 
@@ -42,6 +43,13 @@ class Settings(BaseSettings):
     @property
     def rabbitmq_url(self) -> str:
         return f"amqp://{self.rabbitmq_user}:{self.rabbitmq_password}@{self.rabbitmq_host}:{self.rabbitmq_port}//"
+
+    @property
+    def rabbitmq_amqp_url(self) -> str:
+        """AMQP URL для aio-pika (vhost по умолчанию)."""
+        u = quote(self.rabbitmq_user, safe="")
+        p = quote(self.rabbitmq_password, safe="")
+        return f"amqp://{u}:{p}@{self.rabbitmq_host}:{self.rabbitmq_port}/"
 
     celery_task_always_eager: bool = False
     celery_task_serializer: str = "json"
